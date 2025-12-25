@@ -1,5 +1,6 @@
 import cv2
 import numpy as np
+import json
 
 class ROITracker:
     def __init__(self, video_path, initial_roi):
@@ -12,19 +13,28 @@ class ROITracker:
         self.initial_roi = np.array(initial_roi, dtype=np.float32)
         self.current_roi = self.initial_roi.copy()
         
-        # Feature detector (ORB - nhanh và miễn phí)
-        self.detector = cv2.ORB_create(nfeatures=1000)
-        self.matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
+        # Feature detector - AKAZE tốt hơn cho rotation, fallback về ORB
+        try:
+            self.detector = cv2.AKAZE_create()
+            self.matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
+            print("Sử dụng AKAZE detector (tốt cho rotation)")
+        except:
+            self.detector = cv2.ORB_create(nfeatures=1500)
+            self.matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
+            print("Sử dụng ORB detector")
         
         # Lưu reference frame và features
         self.ref_frame = None
         self.ref_keypoints = None
         self.ref_descriptors = None
         
+        # Re-initialization parameters để tránh drift
+        self.frame_count = 0
+        self.reinit_interval = 30  # Re-init mỗi 30 frames
+        self.last_good_roi = self.initial_roi.copy()
+        
     def _get_background_mask(self, frame):
         """Tạo mask chỉ chứa background (loại bỏ foreground)"""
-        # GIẢI PHÁP 1: Không dùng background subtractor, chỉ dùng edge detection
-        # để tìm vùng có cấu trúc rõ ràng (đường, vạch kẻ, rào chắn)
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         
         # Detect edges (background thường có nhiều edges rõ ràng)
@@ -33,10 +43,6 @@ class ROITracker:
         # Dilate edges để tạo vùng xung quanh edges
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
         edges_dilated = cv2.dilate(edges, kernel, iterations=1)
-        
-        # Vùng có nhiều edges = vùng background tốt để track
-        # Nhưng ta vẫn muốn loại bỏ xe → dùng simple thresholding
-        # Xe thường có màu đồng nhất, background (đường, cỏ) có texture
         
         # Tính gradient magnitude (vùng có texture cao)
         sobelx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
@@ -88,8 +94,15 @@ class ROITracker:
         print(f"Đã detect {len(self.ref_keypoints)} features từ background")
     
     def track_frame(self, frame):
-        """Track camera shift và update ROI"""
+        """Track camera shift và update ROI với HOMOGRAPHY"""
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        
+        # Re-initialize reference mỗi N frames để tránh drift
+        self.frame_count += 1
+        if self.frame_count % self.reinit_interval == 0:
+            print(f"\n=== Re-initializing reference at frame {self.frame_count} ===")
+            self.initialize_reference(frame)
+            return None
         
         # Tạo combined mask cho frame hiện tại
         bg_mask = self._get_background_mask(frame)
@@ -124,30 +137,48 @@ class ROITracker:
         ref_pts = np.float32([self.ref_keypoints[m.queryIdx].pt for m in good_matches])
         curr_pts = np.float32([curr_keypoints[m.trainIdx].pt for m in good_matches])
         
-        # Tính transformation matrix với RANSAC
-        transform_matrix, inliers = cv2.estimateAffinePartial2D(
+        # Tính HOMOGRAPHY matrix với RANSAC (xử lý perspective transformation + rotation)
+        homography_matrix, inliers = cv2.findHomography(
             ref_pts, curr_pts,
             method=cv2.RANSAC,
-            ransacReprojThreshold=3.0,
-            confidence=0.99
+            ransacReprojThreshold=5.0,
+            confidence=0.995,
+            maxIters=2000
         )
         
-        if transform_matrix is None:
-            print("Không tính được transformation matrix!")
+        if homography_matrix is None:
+            print("Không tính được homography matrix!")
             return None
         
-        # Áp dụng transformation lên ROI
-        roi_homogeneous = np.hstack([self.initial_roi, np.ones((len(self.initial_roi), 1))])
-        transformed_roi = roi_homogeneous @ transform_matrix.T
-        self.current_roi = transformed_roi
-        
+        # Kiểm tra quality của homography (tránh degenerate cases)
         num_inliers = np.sum(inliers)
-        print(f"Matches: {len(good_matches)}, Inliers: {num_inliers}")
+        inlier_ratio = num_inliers / len(good_matches)
+        
+        if inlier_ratio < 0.25:  # Nếu quá ít inliers, không tin tưởng kết quả
+            print(f"Inlier ratio quá thấp: {inlier_ratio:.2f}, bỏ qua frame này")
+            return None
+        
+        # Kiểm tra homography có hợp lý không (không quá distorted)
+        det = np.linalg.det(homography_matrix[:2, :2])
+        if det < 0.1 or det > 10:  # Quá scale hoặc degenerate
+            print(f"Homography không hợp lý (det={det:.3f}), bỏ qua frame này")
+            return None
+        
+        # Áp dụng homography lên ROI (perspective transformation)
+        roi_pts = self.initial_roi.reshape(-1, 1, 2).astype(np.float32)
+        transformed_roi = cv2.perspectiveTransform(roi_pts, homography_matrix)
+        self.current_roi = transformed_roi.reshape(-1, 2)
+        
+        # Lưu lại ROI tốt cho trường hợp cần fallback
+        self.last_good_roi = self.current_roi.copy()
+        
+        print(f"Matches: {len(good_matches)}, Inliers: {num_inliers}, Ratio: {inlier_ratio:.2f}, Det: {det:.3f}")
         
         return {
-            'transform_matrix': transform_matrix,
+            'transform_matrix': homography_matrix,
             'num_matches': len(good_matches),
             'num_inliers': num_inliers,
+            'inlier_ratio': inlier_ratio,
             'ref_pts': ref_pts[inliers.ravel() == 1],
             'curr_pts': curr_pts[inliers.ravel() == 1],
             'bg_mask': bg_mask,
@@ -158,47 +189,30 @@ class ROITracker:
         """Vẽ visualization với ROI ban đầu và ROI tracked"""
         vis = frame.copy()
         
-        # Vẽ ROI ban đầu (màu đỏ, đường đứt nét, RẤT DÀY)
+        # Vẽ ROI ban đầu (màu đỏ, đường đứt nét)
         if show_initial:
             pts = self.initial_roi.astype(np.int32)
             for i in range(len(pts)):
                 pt1 = tuple(pts[i])
                 pt2 = tuple(pts[(i + 1) % len(pts)])
-                # Vẽ đường đứt nét DÀY
                 self._draw_dashed_line(vis, pt1, pt2, (0, 0, 255), thickness=3, gap=15)
-            
-
         
-        # Vẽ ROI hiện tại (màu xanh lá, đường liền nét, RẤT DÀY)
+        # Vẽ ROI hiện tại (màu xanh lá, đường liền nét)
         cv2.polylines(vis, [self.current_roi.astype(np.int32)], 
                      isClosed=True, color=(0, 255, 0), thickness=3)
         
-        # Tô màu semi-transparent cho ROI hiện tại (SÁNG HƠN)
+        # Tô màu semi-transparent cho ROI hiện tại
         overlay = vis.copy()
         cv2.fillPoly(overlay, [self.current_roi.astype(np.int32)], (0, 255, 0))
         cv2.addWeighted(overlay, 0.3, vis, 0.7, 0, vis)
         
-        # Label cho ROI hiện tại (CHỮ TO, CÓ BACKGROUND)
-        center_current = self.current_roi.mean(axis=0).astype(int)
-        text = "TRACKED ROI"
-        (text_w, text_h), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 1.2, 3)
-        # Background trắng cho text
-        # cv2.rectangle(vis, (center_current[0] - text_w//2 - 10, center_current[1] + 10),
-        #              (center_current[0] + text_w//2 + 10, center_current[1] + text_h + 20), 
-        #              (255, 255, 255), -1)
-        # cv2.rectangle(vis, (center_current[0] - text_w//2 - 10, center_current[1] + 10),
-        #              (center_current[0] + text_w//2 + 10, center_current[1] + text_h + 20), 
-        #              (0, 255, 0), 3)
-        # cv2.putText(vis, text, (center_current[0] - text_w//2, center_current[1] + text_h + 15),
-        #            cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3)
-        
         if track_result:
-            # Vẽ matched points (background features) - TO HƠN
+            # Vẽ matched points (background features)
             for pt in track_result['curr_pts']:
                 cv2.circle(vis, (int(pt[0]), int(pt[1])), 5, (255, 0, 0), -1)
                 cv2.circle(vis, (int(pt[0]), int(pt[1])), 7, (255, 255, 255), 2)
             
-            # Vẽ vector di chuyển từ initial ROI đến tracked ROI - DÀY HƠN
+            # Vẽ vector di chuyển từ initial ROI đến tracked ROI
             init_center = self.initial_roi.mean(axis=0).astype(int)
             curr_center = self.current_roi.mean(axis=0).astype(int)
             cv2.arrowedLine(vis, tuple(init_center), tuple(curr_center), 
@@ -207,47 +221,25 @@ class ROITracker:
             # Tính displacement
             displacement = np.linalg.norm(curr_center - init_center)
             
-            # Hiển thị thông tin - CHỮ TO HƠN
-            # info_text = [
-            #     f"Matches: {track_result['num_matches']}",
-            #     f"Inliers: {track_result['num_inliers']}",
-            #     f"Displacement: {displacement:.1f}px"
-            # ]
+            # Hiển thị thông tin với background
+            info_text = [
+                f"Frame: {self.frame_count}",
+                f"Matches: {track_result['num_matches']}",
+                f"Inliers: {track_result['num_inliers']}",
+                f"Ratio: {track_result.get('inlier_ratio', 0):.2f}",
+                f"Displacement: {displacement:.1f}px"
+            ]
             
-            # Background cho text
-            # for i, text in enumerate(info_text):
-            #     (text_width, text_height), _ = cv2.getTextSize(
-            #         text, cv2.FONT_HERSHEY_SIMPLEX, 0.9, 2
-            #     )
-            #     cv2.rectangle(vis, (8, 20 + i*40), (text_width + 20, 55 + i*40), 
-            #                  (0, 0, 0), -1)
-            #     cv2.rectangle(vis, (8, 20 + i*40), (text_width + 20, 55 + i*40), 
-            #                  (0, 255, 0), 2)
-            #     cv2.putText(vis, text, (12, 48 + i*40), 
-            #                cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
-        
-        # Legend - TO HƠN
-        legend_y = vis.shape[0] - 100
-        # cv2.rectangle(vis, (10, legend_y - 5), (280, vis.shape[0] - 10), (0, 0, 0), -1)
-        # cv2.rectangle(vis, (10, legend_y - 5), (280, vis.shape[0] - 10), (255, 255, 255), 2)
-        # cv2.putText(vis, "Legend:", (20, legend_y + 20), 
-        #            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-        
-        # Đường đỏ đứt nét
-        # self._draw_dashed_line(vis, (20, legend_y + 40), (60, legend_y + 40), (0, 0, 255), 4, 8)
-        # cv2.putText(vis, "Initial ROI", (70, legend_y + 45), 
-        #            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
-        
-        # Đường xanh liền
-        # cv2.line(vis, (20, legend_y + 60), (60, legend_y + 60), (0, 255, 0), 4)
-        # cv2.putText(vis, "Tracked ROI", (70, legend_y + 65), 
-        #            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
-        
-        # Chấm xanh dương
-        # cv2.circle(vis, (40, legend_y + 80), 5, (255, 0, 0), -1)
-        # cv2.circle(vis, (40, legend_y + 80), 7, (255, 255, 255), 2)
-        # cv2.putText(vis, "BG Features", (70, legend_y + 85), 
-        #            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+            for i, text in enumerate(info_text):
+                (text_width, text_height), _ = cv2.getTextSize(
+                    text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2
+                )
+                cv2.rectangle(vis, (8, 20 + i*35), (text_width + 20, 50 + i*35), 
+                             (0, 0, 0), -1)
+                cv2.rectangle(vis, (8, 20 + i*35), (text_width + 20, 50 + i*35), 
+                             (0, 255, 0), 2)
+                cv2.putText(vis, text, (12, 45 + i*35), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         
         return vis
     
@@ -285,16 +277,24 @@ class ROITracker:
                 out = cv2.VideoWriter(output_path, fourcc, fps, (w*2, h*2))
             else:
                 out = cv2.VideoWriter(output_path, fourcc, fps, (w, h))
-        
-        frame_count = 0
+
+        # Tạo cửa sổ hiển thị
+        win_masks = 'Tracking (Top-left: Result, Top-right: BG Mask, Bottom-left: Combined Mask, Bottom-right: Original)'
+        win_vis = 'ROI Tracking'
+        try:
+            cv2.namedWindow(win_masks, cv2.WINDOW_NORMAL)
+            cv2.namedWindow(win_vis, cv2.WINDOW_NORMAL)
+            cv2.setWindowProperty(win_masks, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+            cv2.setWindowProperty(win_vis, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+        except Exception:
+            pass
         
         while True:
             ret, frame = self.cap.read()
             if not ret:
                 break
             
-            frame_count += 1
-            print(f"\n--- Frame {frame_count} ---")
+            print(f"\n--- Frame {self.frame_count} ---")
             
             # Track
             track_result = self.track_frame(frame)
@@ -311,12 +311,12 @@ class ROITracker:
                 bottom_row = np.hstack([combined_mask_color, frame])
                 grid = np.vstack([top_row, bottom_row])
                 
-                cv2.imshow('Tracking (Top-left: Result, Top-right: BG Mask, Bottom-left: Combined Mask, Bottom-right: Original)', grid)
+                cv2.imshow(win_masks, grid)
                 
                 if output_path:
                     out.write(grid)
             else:
-                cv2.imshow('ROI Tracking', vis)
+                cv2.imshow(win_vis, vis)
                 
                 if output_path:
                     out.write(vis)
@@ -333,7 +333,7 @@ class ROITracker:
 # ===== DEMO USAGE =====
 if __name__ == "__main__":
     # Thay đổi đường dẫn video của bạn ở đây
-    video_path = "data/output_shake.mp4"
+    video_path = "data/webcam.mp4"
     
     # Đọc video để lấy kích thước
     cap = cv2.VideoCapture(video_path)
@@ -347,32 +347,51 @@ if __name__ == "__main__":
     
     print(f"Kích thước video: {w}x{h}")
     
-    # TỰ ĐỘNG TẠO ROI Ở GIỮA FRAME (20% kích thước frame)
-    # Bạn có thể điều chỉnh các tọa độ này cho phù hợp
-    roi_width = int(w * 0.2)
-    roi_height = int(h * 0.2)
-    roi_center_x = w // 2
-    roi_center_y = h // 2
-    # print(h, w)
-    # breakpoint()
-    normalized_roi = [
-        [0.27, 0.62], [0.47, 0.62], [0.56, 0.77], [0.3, 0.78]
-    ]
-    initial_roi = [
-        (int(x * w), int(y * h)) for (x, y) in normalized_roi
-    ]
+    # Cố gắng đọc ROI từ file JSON
+    json_path = "data/webcam.json"
+    normalized_roi = None
+
+    try:
+        with open(json_path, 'r') as f:
+            data = json.load(f)
+            pts = data.get('points') if isinstance(data, dict) else None
+            if pts and isinstance(pts, list):
+                parsed = []
+                for p in pts:
+                    if isinstance(p, dict) and 'x' in p and 'y' in p:
+                        parsed.append((float(p['x']), float(p['y'])))
+                    elif isinstance(p, (list, tuple)) and len(p) >= 2:
+                        parsed.append((float(p[0]), float(p[1])))
+                if len(parsed) >= 3:
+                    normalized_roi = parsed
+    except Exception as e:
+        print(f"Không đọc được JSON ROI từ {json_path}: {e}")
+
+    # Fallback nếu không có dữ liệu hợp lệ
+    if normalized_roi is None:
+        normalized_roi = [
+            (0.27, 0.62), (0.47, 0.62), (0.56, 0.77), (0.3, 0.78)
+        ]
+        print("Dùng ROI mặc định (không tìm thấy/không hợp lệ file JSON).")
+    else:
+        print(f"Đã load ROI từ {json_path}: {normalized_roi}")
+
+    # Chuyển normalized coords sang pixel
+    max_coord = max(max(x, y) for (x, y) in normalized_roi)
+    if max_coord <= 1.5:
+        initial_roi = [(int(x * w), int(y * h)) for (x, y) in normalized_roi]
+    else:
+        initial_roi = [(int(x), int(y)) for (x, y) in normalized_roi]
     
     print(f"ROI tại vị trí: {initial_roi}")
-    print("Nếu muốn đổi vị trí ROI, hãy sửa các tọa độ trong initial_roi")
     
-    # Tạo tracker
+    # Tạo tracker với Homography support
     tracker = ROITracker(video_path, initial_roi)
     
     # Xử lý video
     tracker.process_video(
-        output_path="output/output_tracked.mp4",  # Set None nếu không muốn save
-        show_masks=True  # Hiển thị background mask và combined mask
+        output_path="output/output_tracked.mp4",
+        show_masks=True
     )
     
     print("\nHoàn tất!")
-
