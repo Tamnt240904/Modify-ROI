@@ -1,397 +1,417 @@
 import cv2
 import numpy as np
 import json
+import sys
+from collections import deque
 
-class ROITracker:
-    def __init__(self, video_path, initial_roi):
+class ROIStabilizer:
+    def __init__(self, detector_type='ORB', smoothing_window=5, 
+                 homography_confidence=0.99, outlier_threshold=3.0):
         """
-        Args:
-            video_path: Đường dẫn video
-            initial_roi: List of points [(x1,y1), (x2,y2), ...] định nghĩa ROI ban đầu
+        Khởi tạo ROI Stabilizer với các tham số chống rung
+        detector_type: 'ORB', 'SIFT', hoặc 'AKAZE'
+        smoothing_window: Số frame để làm mượt (temporal smoothing)
+        homography_confidence: Độ tin cậy RANSAC (0.95-0.999)
+        outlier_threshold: Ngưỡng loại bỏ outlier (pixel)
         """
-        self.cap = cv2.VideoCapture(video_path)
-        self.initial_roi = np.array(initial_roi, dtype=np.float32)
-        self.current_roi = self.initial_roi.copy()
+        self.detector_type = detector_type
+        self.reference_frame = None
+        self.reference_keypoints = None
+        self.reference_descriptors = None
+        self.roi_points = None
         
-        # Feature detector - AKAZE tốt hơn cho rotation, fallback về ORB
-        try:
+        # Tham số chống rung
+        self.smoothing_window = smoothing_window
+        self.homography_history = deque(maxlen=smoothing_window)
+        self.roi_history = deque(maxlen=smoothing_window)
+        self.homography_confidence = homography_confidence
+        self.outlier_threshold = outlier_threshold
+        
+        # Khởi tạo feature detector
+        if detector_type == 'ORB':
+            self.detector = cv2.ORB_create(nfeatures=3000)  # Tăng số features
+            self.matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
+        elif detector_type == 'SIFT':
+            self.detector = cv2.SIFT_create()
+            self.matcher = cv2.BFMatcher(cv2.NORM_L2, crossCheck=False)
+        elif detector_type == 'AKAZE':
             self.detector = cv2.AKAZE_create()
             self.matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
-            print("Sử dụng AKAZE detector (tốt cho rotation)")
-        except:
-            self.detector = cv2.ORB_create(nfeatures=1500)
-            self.matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
-            print("Sử dụng ORB detector")
-        
-        # Lưu reference frame và features
-        self.ref_frame = None
-        self.ref_keypoints = None
-        self.ref_descriptors = None
-        
-        # Re-initialization parameters để tránh drift
-        self.frame_count = 0
-        self.reinit_interval = 30  # Re-init mỗi 30 frames
-        self.last_good_roi = self.initial_roi.copy()
-        
-    def _get_background_mask(self, frame):
-        """Tạo mask chỉ chứa background (loại bỏ foreground)"""
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        
-        # Detect edges (background thường có nhiều edges rõ ràng)
-        edges = cv2.Canny(gray, 50, 150)
-        
-        # Dilate edges để tạo vùng xung quanh edges
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
-        edges_dilated = cv2.dilate(edges, kernel, iterations=1)
-        
-        # Tính gradient magnitude (vùng có texture cao)
-        sobelx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
-        sobely = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
-        gradient_mag = np.sqrt(sobelx**2 + sobely**2)
-        gradient_mag = np.uint8(gradient_mag / gradient_mag.max() * 255)
-        
-        # Threshold: vùng có gradient cao = background có texture
-        _, texture_mask = cv2.threshold(gradient_mag, 30, 255, cv2.THRESH_BINARY)
-        
-        # Combine edges và texture
-        bg_mask = cv2.bitwise_or(edges_dilated, texture_mask)
-        
-        # Morphological operations để clean
-        kernel_clean = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        bg_mask = cv2.morphologyEx(bg_mask, cv2.MORPH_CLOSE, kernel_clean)
-        bg_mask = cv2.morphologyEx(bg_mask, cv2.MORPH_OPEN, kernel_clean)
-        
-        return bg_mask
     
-    def _exclude_roi_mask(self, frame_shape, roi_points, margin=50):
-        """Tạo mask loại bỏ vùng ROI + margin"""
-        mask = np.ones(frame_shape[:2], dtype=np.uint8) * 255
+    def set_reference_roi(self, frame, roi_points):
+        """
+        Đặt frame tham chiếu và ROI ban đầu
+        """
+        self.reference_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        self.roi_points = roi_points
         
-        # Mở rộng ROI thêm margin
-        roi_expanded = roi_points.copy()
-        center = roi_expanded.mean(axis=0)
-        roi_expanded = center + (roi_expanded - center) * (1 + margin/100)
+        # Detect features trên toàn bộ frame
+        self.reference_keypoints, self.reference_descriptors = \
+            self.detector.detectAndCompute(self.reference_frame, None)
         
-        cv2.fillPoly(mask, [roi_expanded.astype(np.int32)], 0)
+        # Clear history khi set reference mới
+        self.homography_history.clear()
+        self.roi_history.clear()
         
-        return mask
+        print(f"Đã phát hiện {len(self.reference_keypoints)} keypoints trong reference frame")
     
-    def initialize_reference(self, frame):
-        """Khởi tạo reference frame và features"""
-        self.ref_frame = frame.copy()
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        
-        # Tạo combined mask
-        bg_mask = self._get_background_mask(frame)
-        roi_mask = self._exclude_roi_mask(frame.shape, self.current_roi)
-        combined_mask = cv2.bitwise_and(bg_mask, roi_mask)
-        
-        # Detect features chỉ trong vùng background ngoài ROI
-        self.ref_keypoints, self.ref_descriptors = self.detector.detectAndCompute(
-            gray, mask=combined_mask
-        )
-        
-        print(f"Đã detect {len(self.ref_keypoints)} features từ background")
-    
-    def track_frame(self, frame):
-        """Track camera shift và update ROI với HOMOGRAPHY"""
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        
-        # Re-initialize reference mỗi N frames để tránh drift
-        self.frame_count += 1
-        if self.frame_count % self.reinit_interval == 0:
-            print(f"\n=== Re-initializing reference at frame {self.frame_count} ===")
-            self.initialize_reference(frame)
+    def smooth_homography(self, H):
+        """
+        Làm mượt homography matrix bằng cách lấy trung bình
+        """
+        if H is None:
             return None
         
-        # Tạo combined mask cho frame hiện tại
-        bg_mask = self._get_background_mask(frame)
-        roi_mask = self._exclude_roi_mask(frame.shape, self.current_roi)
-        combined_mask = cv2.bitwise_and(bg_mask, roi_mask)
+        self.homography_history.append(H)
+        
+        if len(self.homography_history) < 2:
+            return H
+        
+        # Tính trung bình có trọng số (frame gần đây có trọng số cao hơn)
+        weights = np.linspace(0.5, 1.0, len(self.homography_history))
+        weights = weights / weights.sum()
+        
+        smoothed_H = np.zeros((3, 3))
+        for i, h in enumerate(self.homography_history):
+            smoothed_H += weights[i] * h
+        
+        return smoothed_H
+    
+    def smooth_roi_points(self, new_points):
+        """
+        Làm mượt tọa độ ROI theo thời gian
+        """
+        self.roi_history.append(new_points)
+        
+        if len(self.roi_history) < 2:
+            return new_points
+        
+        # Exponential moving average
+        alpha = 0.3  # Hệ số làm mượt (0-1), càng nhỏ càng mượt
+        
+        smoothed_points = []
+        for i in range(len(new_points)):
+            x_smooth = new_points[i][0]
+            y_smooth = new_points[i][1]
+            
+            # Lấy trung bình từ history
+            for j, hist_points in enumerate(self.roi_history):
+                if j < len(self.roi_history) - 1:
+                    weight = (1 - alpha) ** (len(self.roi_history) - 1 - j)
+                    x_smooth = alpha * x_smooth + (1 - alpha) * hist_points[i][0]
+                    y_smooth = alpha * y_smooth + (1 - alpha) * hist_points[i][1]
+            
+            smoothed_points.append([x_smooth, y_smooth])
+        
+        return smoothed_points
+    
+    def filter_matches_by_distance(self, matches, src_pts, dst_pts):
+        """
+        Lọc matches dựa trên khoảng cách geometric
+        """
+        if len(matches) < 10:
+            return matches, src_pts, dst_pts
+        
+        # Tính khoảng cách di chuyển của mỗi match
+        distances = np.linalg.norm(dst_pts.reshape(-1, 2) - src_pts.reshape(-1, 2), axis=1)
+        
+        # Loại bỏ outliers bằng median absolute deviation
+        median_dist = np.median(distances)
+        mad = np.median(np.abs(distances - median_dist))
+        threshold = median_dist + self.outlier_threshold * mad
+        
+        # Lọc matches
+        mask = distances < threshold
+        filtered_matches = [m for i, m in enumerate(matches) if mask[i]]
+        filtered_src = src_pts[mask]
+        filtered_dst = dst_pts[mask]
+        
+        return filtered_matches, filtered_src, filtered_dst
+    
+    def stabilize_roi(self, current_frame):
+        """
+        Tính toán vị trí ROI mới với chống rung
+        """
+        if self.reference_frame is None:
+            return None
+        
+        gray = cv2.cvtColor(current_frame, cv2.COLOR_BGR2GRAY)
         
         # Detect features trong frame hiện tại
-        curr_keypoints, curr_descriptors = self.detector.detectAndCompute(
-            gray, mask=combined_mask
-        )
+        current_kp, current_desc = self.detector.detectAndCompute(gray, None)
         
-        if curr_descriptors is None or len(curr_keypoints) < 10:
-            print("Không đủ features để track!")
-            return None
+        if current_desc is None or len(current_kp) < 10:
+            # Sử dụng ROI từ history nếu có
+            if len(self.roi_history) > 0:
+                return self.roi_history[-1], 0
+            return self.roi_points, 0
         
         # Match features
-        matches = self.matcher.knnMatch(self.ref_descriptors, curr_descriptors, k=2)
+        matches = self.matcher.knnMatch(self.reference_descriptors, current_desc, k=2)
         
-        # Lọc good matches bằng Lowe's ratio test
+        # Lọc matches tốt bằng Lowe's ratio test (nghiêm ngặt hơn)
         good_matches = []
         for match_pair in matches:
             if len(match_pair) == 2:
                 m, n = match_pair
-                if m.distance < 0.75 * n.distance:
+                if m.distance < 0.7 * n.distance:  # Giảm từ 0.75 xuống 0.7
                     good_matches.append(m)
         
-        if len(good_matches) < 10:
-            print(f"Chỉ có {len(good_matches)} good matches, không đủ để tính transformation!")
-            return None
+        if len(good_matches) < 15:  # Tăng threshold từ 10 lên 15
+            if len(self.roi_history) > 0:
+                return self.roi_history[-1], len(good_matches)
+            return self.roi_points, len(good_matches)
         
-        # Lấy corresponding points
-        ref_pts = np.float32([self.ref_keypoints[m.queryIdx].pt for m in good_matches])
-        curr_pts = np.float32([curr_keypoints[m.trainIdx].pt for m in good_matches])
+        # Lấy tọa độ các điểm tương ứng
+        src_pts = np.float32([self.reference_keypoints[m.queryIdx].pt 
+                              for m in good_matches]).reshape(-1, 1, 2)
+        dst_pts = np.float32([current_kp[m.trainIdx].pt 
+                              for m in good_matches]).reshape(-1, 1, 2)
         
-        # Tính HOMOGRAPHY matrix với RANSAC (xử lý perspective transformation + rotation)
-        homography_matrix, inliers = cv2.findHomography(
-            ref_pts, curr_pts,
-            method=cv2.RANSAC,
-            ransacReprojThreshold=5.0,
-            confidence=0.995,
-            maxIters=2000
+        # Lọc matches dựa trên khoảng cách
+        good_matches, src_pts, dst_pts = self.filter_matches_by_distance(
+            good_matches, src_pts, dst_pts
         )
         
-        if homography_matrix is None:
-            print("Không tính được homography matrix!")
-            return None
+        if len(good_matches) < 15:
+            if len(self.roi_history) > 0:
+                return self.roi_history[-1], len(good_matches)
+            return self.roi_points, len(good_matches)
         
-        # Kiểm tra quality của homography (tránh degenerate cases)
-        num_inliers = np.sum(inliers)
-        inlier_ratio = num_inliers / len(good_matches)
+        # Tính homography với RANSAC nghiêm ngặt
+        H, mask = cv2.findHomography(
+            src_pts, dst_pts, 
+            cv2.RANSAC, 
+            ransacReprojThreshold=3.0,  # Giảm từ 5.0 xuống 3.0
+            confidence=self.homography_confidence
+        )
         
-        if inlier_ratio < 0.25:  # Nếu quá ít inliers, không tin tưởng kết quả
-            print(f"Inlier ratio quá thấp: {inlier_ratio:.2f}, bỏ qua frame này")
-            return None
+        if H is None:
+            if len(self.roi_history) > 0:
+                return self.roi_history[-1], len(good_matches)
+            return self.roi_points, len(good_matches)
         
-        # Kiểm tra homography có hợp lý không (không quá distorted)
-        det = np.linalg.det(homography_matrix[:2, :2])
-        if det < 0.1 or det > 10:  # Quá scale hoặc degenerate
-            print(f"Homography không hợp lý (det={det:.3f}), bỏ qua frame này")
-            return None
+        # Làm mượt homography
+        H_smoothed = self.smooth_homography(H)
         
-        # Áp dụng homography lên ROI (perspective transformation)
-        roi_pts = self.initial_roi.reshape(-1, 1, 2).astype(np.float32)
-        transformed_roi = cv2.perspectiveTransform(roi_pts, homography_matrix)
-        self.current_roi = transformed_roi.reshape(-1, 2)
+        # Transform các điểm ROI
+        h, w = current_frame.shape[:2]
+        roi_corners = np.float32([[p[0] * w, p[1] * h] for p in self.roi_points]).reshape(-1, 1, 2)
         
-        # Lưu lại ROI tốt cho trường hợp cần fallback
-        self.last_good_roi = self.current_roi.copy()
+        transformed_corners = cv2.perspectiveTransform(roi_corners, H_smoothed)
         
-        print(f"Matches: {len(good_matches)}, Inliers: {num_inliers}, Ratio: {inlier_ratio:.2f}, Det: {det:.3f}")
+        # Normalize lại về 0-1
+        new_points = []
+        for corner in transformed_corners:
+            x_norm = np.clip(corner[0][0] / w, 0, 1)
+            y_norm = np.clip(corner[0][1] / h, 0, 1)
+            new_points.append([x_norm, y_norm])
         
-        return {
-            'transform_matrix': homography_matrix,
-            'num_matches': len(good_matches),
-            'num_inliers': num_inliers,
-            'inlier_ratio': inlier_ratio,
-            'ref_pts': ref_pts[inliers.ravel() == 1],
-            'curr_pts': curr_pts[inliers.ravel() == 1],
-            'bg_mask': bg_mask,
-            'combined_mask': combined_mask
-        }
-    
-    def draw_visualization(self, frame, track_result, show_initial=True):
-        """Vẽ visualization với ROI ban đầu và ROI tracked"""
-        vis = frame.copy()
+        # Làm mượt tọa độ ROI
+        smoothed_points = self.smooth_roi_points(new_points)
         
-        # Vẽ ROI ban đầu (màu đỏ, đường đứt nét)
-        if show_initial:
-            pts = self.initial_roi.astype(np.int32)
-            for i in range(len(pts)):
-                pt1 = tuple(pts[i])
-                pt2 = tuple(pts[(i + 1) % len(pts)])
-                self._draw_dashed_line(vis, pt1, pt2, (0, 0, 255), thickness=3, gap=15)
+        # Đếm số inliers
+        inliers = np.sum(mask) if mask is not None else 0
         
-        # Vẽ ROI hiện tại (màu xanh lá, đường liền nét)
-        cv2.polylines(vis, [self.current_roi.astype(np.int32)], 
-                     isClosed=True, color=(0, 255, 0), thickness=3)
-        
-        # Tô màu semi-transparent cho ROI hiện tại
-        overlay = vis.copy()
-        cv2.fillPoly(overlay, [self.current_roi.astype(np.int32)], (0, 255, 0))
-        cv2.addWeighted(overlay, 0.3, vis, 0.7, 0, vis)
-        
-        if track_result:
-            # Vẽ matched points (background features)
-            for pt in track_result['curr_pts']:
-                cv2.circle(vis, (int(pt[0]), int(pt[1])), 5, (255, 0, 0), -1)
-                cv2.circle(vis, (int(pt[0]), int(pt[1])), 7, (255, 255, 255), 2)
-            
-            # Vẽ vector di chuyển từ initial ROI đến tracked ROI
-            init_center = self.initial_roi.mean(axis=0).astype(int)
-            curr_center = self.current_roi.mean(axis=0).astype(int)
-            cv2.arrowedLine(vis, tuple(init_center), tuple(curr_center), 
-                           (0, 255, 255), 4, tipLength=0.2)
-            
-            # Tính displacement
-            displacement = np.linalg.norm(curr_center - init_center)
-            
-            # Hiển thị thông tin với background
-            info_text = [
-                f"Frame: {self.frame_count}",
-                f"Matches: {track_result['num_matches']}",
-                f"Inliers: {track_result['num_inliers']}",
-                f"Ratio: {track_result.get('inlier_ratio', 0):.2f}",
-                f"Displacement: {displacement:.1f}px"
-            ]
-            
-            for i, text in enumerate(info_text):
-                (text_width, text_height), _ = cv2.getTextSize(
-                    text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2
-                )
-                cv2.rectangle(vis, (8, 20 + i*35), (text_width + 20, 50 + i*35), 
-                             (0, 0, 0), -1)
-                cv2.rectangle(vis, (8, 20 + i*35), (text_width + 20, 50 + i*35), 
-                             (0, 255, 0), 2)
-                cv2.putText(vis, text, (12, 45 + i*35), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        
-        return vis
-    
-    def _draw_dashed_line(self, img, pt1, pt2, color, thickness=1, gap=10):
-        """Vẽ đường đứt nét"""
-        dist = np.sqrt((pt2[0] - pt1[0])**2 + (pt2[1] - pt1[1])**2)
-        pts = []
-        for i in np.arange(0, dist, gap):
-            r = i / dist
-            x = int((pt1[0] * (1 - r) + pt2[0] * r) + 0.5)
-            y = int((pt1[1] * (1 - r) + pt2[1] * r) + 0.5)
-            pts.append((x, y))
-        
-        for i in range(0, len(pts) - 1, 2):
-            cv2.line(img, pts[i], pts[i + 1], color, thickness)
-    
-    def process_video(self, output_path=None, show_masks=True):
-        """Xử lý toàn bộ video"""
-        # Đọc frame đầu tiên
-        ret, frame = self.cap.read()
-        if not ret:
-            print("Không đọc được video!")
-            return
-        
-        # Initialize reference
-        self.initialize_reference(frame)
-        
-        # Setup video writer nếu cần
-        if output_path:
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            fps = self.cap.get(cv2.CAP_PROP_FPS)
-            h, w = frame.shape[:2]
-            
-            if show_masks:
-                out = cv2.VideoWriter(output_path, fourcc, fps, (w*2, h*2))
-            else:
-                out = cv2.VideoWriter(output_path, fourcc, fps, (w, h))
-
-        # Tạo cửa sổ hiển thị
-        win_masks = 'Tracking (Top-left: Result, Top-right: BG Mask, Bottom-left: Combined Mask, Bottom-right: Original)'
-        win_vis = 'ROI Tracking'
-        try:
-            cv2.namedWindow(win_masks, cv2.WINDOW_NORMAL)
-            cv2.namedWindow(win_vis, cv2.WINDOW_NORMAL)
-            cv2.setWindowProperty(win_masks, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
-            cv2.setWindowProperty(win_vis, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
-        except Exception:
-            pass
-        
-        while True:
-            ret, frame = self.cap.read()
-            if not ret:
-                break
-            
-            print(f"\n--- Frame {self.frame_count} ---")
-            
-            # Track
-            track_result = self.track_frame(frame)
-            
-            # Visualize
-            vis = self.draw_visualization(frame, track_result)
-            
-            if show_masks and track_result:
-                # Tạo grid 2x2: [vis, bg_mask, combined_mask, original]
-                bg_mask_color = cv2.cvtColor(track_result['bg_mask'], cv2.COLOR_GRAY2BGR)
-                combined_mask_color = cv2.cvtColor(track_result['combined_mask'], cv2.COLOR_GRAY2BGR)
-                
-                top_row = np.hstack([vis, bg_mask_color])
-                bottom_row = np.hstack([combined_mask_color, frame])
-                grid = np.vstack([top_row, bottom_row])
-                
-                cv2.imshow(win_masks, grid)
-                
-                if output_path:
-                    out.write(grid)
-            else:
-                cv2.imshow(win_vis, vis)
-                
-                if output_path:
-                    out.write(vis)
-            
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
-        
-        self.cap.release()
-        if output_path:
-            out.release()
-        cv2.destroyAllWindows()
+        return smoothed_points, inliers
 
 
-# ===== DEMO USAGE =====
-if __name__ == "__main__":
-    # Thay đổi đường dẫn video của bạn ở đây
-    video_path = "data/webcam.mp4"
-    
-    # Đọc video để lấy kích thước
-    cap = cv2.VideoCapture(video_path)
-    ret, first_frame = cap.read()
-    if not ret:
-        print("Không đọc được video!")
-        exit()
-    
-    h, w = first_frame.shape[:2]
-    cap.release()
-    
-    print(f"Kích thước video: {w}x{h}")
-    
-    # Cố gắng đọc ROI từ file JSON
-    json_path = "data/webcam.json"
-    normalized_roi = None
-
+def load_roi_from_json(json_path):
+    """
+    Đọc ROI từ file JSON
+    """
     try:
         with open(json_path, 'r') as f:
             data = json.load(f)
-            pts = data.get('points') if isinstance(data, dict) else None
-            if pts and isinstance(pts, list):
-                parsed = []
-                for p in pts:
-                    if isinstance(p, dict) and 'x' in p and 'y' in p:
-                        parsed.append((float(p['x']), float(p['y'])))
-                    elif isinstance(p, (list, tuple)) and len(p) >= 2:
-                        parsed.append((float(p[0]), float(p[1])))
-                if len(parsed) >= 3:
-                    normalized_roi = parsed
+        
+        points = data.get('points', [])
+        roi_points = [(p['x'], p['y']) for p in points]
+        
+        if len(roi_points) < 3:
+            raise ValueError("ROI phải có ít nhất 3 điểm")
+        
+        print(f"Đã load ROI với {len(roi_points)} điểm từ {json_path}")
+        return roi_points
+    
     except Exception as e:
-        print(f"Không đọc được JSON ROI từ {json_path}: {e}")
+        print(f"Lỗi khi đọc file JSON: {e}")
+        return None
 
-    # Fallback nếu không có dữ liệu hợp lệ
-    if normalized_roi is None:
-        normalized_roi = [
-            (0.27, 0.62), (0.47, 0.62), (0.56, 0.77), (0.3, 0.78)
-        ]
-        print("Dùng ROI mặc định (không tìm thấy/không hợp lệ file JSON).")
-    else:
-        print(f"Đã load ROI từ {json_path}: {normalized_roi}")
 
-    # Chuyển normalized coords sang pixel
-    max_coord = max(max(x, y) for (x, y) in normalized_roi)
-    if max_coord <= 1.5:
-        initial_roi = [(int(x * w), int(y * h)) for (x, y) in normalized_roi]
-    else:
-        initial_roi = [(int(x), int(y)) for (x, y) in normalized_roi]
+def draw_roi_polygon(frame, roi_points, color=(0, 255, 0), thickness=2):
+    """
+    Vẽ ROI polygon lên frame
+    """
+    h, w = frame.shape[:2]
+    pts = np.array([[int(p[0] * w), int(p[1] * h)] for p in roi_points], np.int32)
+    pts = pts.reshape((-1, 1, 2))
+    cv2.polylines(frame, [pts], isClosed=True, color=color, thickness=thickness)
+    return pts
+
+
+def get_roi_mask(frame_shape, roi_points):
+    """
+    Tạo mask cho vùng ROI
+    """
+    h, w = frame_shape[:2]
+    mask = np.zeros((h, w), dtype=np.uint8)
+    pts = np.array([[int(p[0] * w), int(p[1] * h)] for p in roi_points], np.int32)
+    cv2.fillPoly(mask, [pts], 255)
+    return mask
+
+
+def extract_roi_region(frame, roi_points):
+    """
+    Trích xuất vùng ROI từ frame
+    """
+    mask = get_roi_mask(frame.shape, roi_points)
     
-    print(f"ROI tại vị trí: {initial_roi}")
+    # Tìm bounding box
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if len(contours) == 0:
+        return None
     
-    # Tạo tracker với Homography support
-    tracker = ROITracker(video_path, initial_roi)
+    x, y, w, h = cv2.boundingRect(contours[0])
     
-    # Xử lý video
-    tracker.process_video(
-        output_path="output/output_tracked.mp4",
-        show_masks=True
+    if w <= 0 or h <= 0:
+        return None
+    
+    # Crop và apply mask
+    roi_region = frame[y:y+h, x:x+w].copy()
+    mask_crop = mask[y:y+h, x:x+w]
+    
+    roi_region[mask_crop == 0] = 0
+    
+    return roi_region
+
+
+def main():
+    # Đường dẫn file
+    video_path = 'data/webcam.mp4'
+    json_path = 'data/webcam.json'
+    
+    # Kiểm tra arguments từ command line
+    if len(sys.argv) >= 2:
+        video_path = sys.argv[1]
+    if len(sys.argv) >= 3:
+        json_path = sys.argv[2]
+    
+    print(f"Video: {video_path}")
+    print(f"ROI JSON: {json_path}")
+    
+    # Load ROI từ JSON
+    roi_points = load_roi_from_json(json_path)
+    if roi_points is None:
+        print("Không thể load ROI. Thoát chương trình.")
+        return
+    
+    # Mở video
+    cap = cv2.VideoCapture(video_path)
+    
+    if not cap.isOpened():
+        print(f"Không thể mở video: {video_path}")
+        return
+    
+    # Đọc frame đầu tiên
+    ret, first_frame = cap.read()
+    if not ret:
+        print("Không thể đọc frame")
+        return
+    
+    print(f"Video size: {first_frame.shape[1]}x{first_frame.shape[0]}")
+    
+    # Cấu hình kích thước cửa sổ hiển thị cố định
+    DISPLAY_WIDTH = 1280
+    DISPLAY_HEIGHT = 720
+    
+    # Tạo cửa sổ với kích thước cố định
+    window_name = 'ROI Stabilization (Anti-Shake)'
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(window_name, DISPLAY_WIDTH, DISPLAY_HEIGHT)
+    
+    # Hiển thị ROI ban đầu
+    display_frame = first_frame.copy()
+    draw_roi_polygon(display_frame, roi_points, color=(0, 255, 0), thickness=2)
+    display_resized = cv2.resize(display_frame, (DISPLAY_WIDTH, DISPLAY_HEIGHT))
+    cv2.imshow(window_name, display_resized)
+    cv2.waitKey(2000)
+    
+    # Khởi tạo stabilizer với tham số chống rung
+    stabilizer = ROIStabilizer(
+        detector_type='ORB',
+        smoothing_window=7,  # Tăng window size để mượt hơn
+        homography_confidence=0.995,
+        outlier_threshold=2.5
     )
+    stabilizer.set_reference_roi(first_frame, roi_points)
     
-    print("\nHoàn tất!")
+    # Tạo video writer
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    out = cv2.VideoWriter('stabilized_output.mp4', fourcc, fps,
+                          (first_frame.shape[1], first_frame.shape[0]))
+    
+    frame_count = 0
+    
+    # Reset video về đầu
+    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+    
+    print("\nBắt đầu xử lý video...")
+    print("Nhấn 'q' để thoát")
+    
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        
+        frame_count += 1
+        
+        # Tính toán vị trí ROI mới
+        new_roi_points, inliers_count = stabilizer.stabilize_roi(frame)
+        
+        # Vẽ ROI mới
+        color = (0, 255, 0) if inliers_count >= 15 else (0, 165, 255)
+        draw_roi_polygon(frame, new_roi_points, color=color, thickness=2)
+        
+        # Hiển thị thông tin
+        cv2.putText(frame, f"Inliers: {inliers_count}", (10, 30),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        cv2.putText(frame, f"Frame: {frame_count}", (10, 60),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        cv2.putText(frame, f"Smoothing: ON", (10, 90),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        
+        # Trích xuất và hiển thị vùng ROI
+        roi_region = extract_roi_region(frame, new_roi_points)
+        if roi_region is not None and roi_region.size > 0:
+            try:
+                roi_resized = cv2.resize(roi_region, (200, 150))
+                h, w = frame.shape[:2]
+                frame[10:160, w-210:w-10] = roi_resized
+            except:
+                pass
+        
+        # Ghi frame
+        out.write(frame)
+        
+        # Hiển thị
+        cv2.imshow('ROI Stabilization (Anti-Shake)', frame)
+        
+        if frame_count % 30 == 0:
+            print(f"Processed {frame_count} frames...")
+        
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'):
+            break
+    
+    cap.release()
+    out.release()
+    cv2.destroyAllWindows()
+    
+    print(f"\n✓ Đã xử lý {frame_count} frames")
+    print(f"✓ FPS: {fps}")
+    print("✓ Video đã được lưu: stabilized_output.mp4")
+
+
+if __name__ == "__main__":
+    main()
